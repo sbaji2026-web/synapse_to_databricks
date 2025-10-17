@@ -1,1 +1,87 @@
+-- Create sample target table
+CREATE TABLE IF NOT EXISTS dbo.TargetSales
+(
+    SaleID    BIGINT PRIMARY KEY,
+    CustomerID INT NOT NULL,
+    Amount     DECIMAL(18,2),
+    SaleDate   DATETIME2,
+    LastUpdated DATETIME2
+);
+
+-- Create sample staging table (could be an external table or temp table in real ETL)
+CREATE TABLE IF NOT EXISTS dbo.StagingSales
+(
+    SaleID     BIGINT,
+    CustomerID INT,
+    Amount     DECIMAL(18,2),
+    SaleDate   DATETIME2
+);
+
+GO
+
+-- Stored procedure: Upsert from staging into target
+CREATE PROCEDURE dbo.sp_UpsertSalesFromStaging
+    @BatchId      VARCHAR(50) = NULL,   -- optional parameter
+    @RowsProcessed INT OUTPUT,
+    @ReturnMessage NVARCHAR(4000) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @StartTime DATETIME2 = SYSUTCDATETIME();
+    SET @RowsProcessed = 0;
+    SET @ReturnMessage = N'';
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- Example: MERGE-based upsert (supported syntax in Synapse dedicated SQL pool)
+        MERGE dbo.TargetSales AS T
+        USING dbo.StagingSales AS S
+            ON T.SaleID = S.SaleID
+        WHEN MATCHED AND (
+             ISNULL(T.Amount,0) <> ISNULL(S.Amount,0)
+             OR ISNULL(T.CustomerID,0) <> ISNULL(S.CustomerID,0)
+             OR ISNULL(CONVERT(VARCHAR(30),T.SaleDate,126),'') <> ISNULL(CONVERT(VARCHAR(30),S.SaleDate,126),'')
+        )
+        THEN
+            UPDATE SET
+                T.CustomerID = S.CustomerID,
+                T.Amount = S.Amount,
+                T.SaleDate = S.SaleDate,
+                T.LastUpdated = SYSUTCDATETIME()
+        WHEN NOT MATCHED BY TARGET
+        THEN
+            INSERT (SaleID, CustomerID, Amount, SaleDate, LastUpdated)
+            VALUES (S.SaleID, S.CustomerID, S.Amount, S.SaleDate, SYSUTCDATETIME())
+        ;
+
+        -- Capture number of rows affected by MERGE
+        SET @RowsProcessed = @@ROWCOUNT;
+
+        -- Optional: clear staging after successful load
+        TRUNCATE TABLE dbo.StagingSales;
+
+        COMMIT TRANSACTION;
+
+        SET @ReturnMessage = CONCAT('Success: processed ', @RowsProcessed, ' rows. BatchId=', ISNULL(@BatchId,'N/A'),
+                                   '; duration=', CONVERT(varchar(32), DATEADD(ms, DATEDIFF(ms,@StartTime,SYSUTCDATETIME()), 0), 121));
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;
+
+        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @ErrNum INT = ERROR_NUMBER();
+        DECLARE @ErrState INT = ERROR_STATE();
+
+        SET @ReturnMessage = CONCAT('Error: ', @ErrMsg, ' (Number=', @ErrNum, ', State=', @ErrState, ').');
+        SET @RowsProcessed = -1;
+    END CATCH
+END
+GO
+
+-- Example: execute the stored procedure
+DECLARE @rows INT, @msg NVARCHAR(4000);
+EXEC dbo.sp_UpsertSalesFromStaging @BatchId = 'batch_20251017_001', @RowsProcessed = @rows OUTPUT, @ReturnMessage = @msg OUTPUT;
+SELECT @rows AS RowsProcessed, @msg AS Message;
 

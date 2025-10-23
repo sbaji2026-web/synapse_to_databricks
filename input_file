@@ -1,0 +1,168 @@
+CREATE OR ALTER PROCEDURE [etl].[usp_load_customer_sales]
+AS
+BEGIN
+    ------------------------------------------------------------------------
+    -- Author      : Sample Procedure for Azure Synapse
+    -- Description : ETL procedure to load data from staging into final table
+    --               with validation, transformation, and audit logging.
+    -- Created On  : 2025-10-23
+    ------------------------------------------------------------------------
+    SET NOCOUNT ON;
+
+    DECLARE 
+        @StartTime DATETIME = SYSDATETIME(),
+        @RowsInserted INT = 0,
+        @RowsUpdated INT = 0,
+        @RowsRejected INT = 0,
+        @ErrorMessage NVARCHAR(4000) = '',
+        @BatchId UNIQUEIDENTIFIER = NEWID();
+
+    BEGIN TRY
+        --------------------------------------------------------------------
+        -- 1. Insert audit log start entry
+        --------------------------------------------------------------------
+        INSERT INTO [audit].[etl_log] (
+            BatchId, ProcedureName, Status, StartTime
+        )
+        VALUES (
+            @BatchId, 'etl.usp_load_customer_sales', 'STARTED', @StartTime
+        );
+
+        --------------------------------------------------------------------
+        -- 2. Validate data in staging
+        --------------------------------------------------------------------
+        IF OBJECT_ID('tempdb..#ValidData') IS NOT NULL DROP TABLE #ValidData;
+        IF OBJECT_ID('tempdb..#InvalidData') IS NOT NULL DROP TABLE #InvalidData;
+
+        SELECT 
+            s.CustomerId,
+            s.OrderDate,
+            s.SalesAmount,
+            s.Region,
+            CASE 
+                WHEN s.CustomerId IS NULL THEN 'CustomerId is NULL'
+                WHEN s.SalesAmount <= 0 THEN 'Invalid SalesAmount'
+                WHEN s.OrderDate > SYSDATETIME() THEN 'Future OrderDate'
+                ELSE NULL
+            END AS ValidationError
+        INTO #StageWithValidation
+        FROM [stg].[customer_sales] s;
+
+        --------------------------------------------------------------------
+        -- 3. Split valid and invalid data
+        --------------------------------------------------------------------
+        SELECT * 
+        INTO #ValidData
+        FROM #StageWithValidation 
+        WHERE ValidationError IS NULL;
+
+        SELECT * 
+        INTO #InvalidData
+        FROM #StageWithValidation 
+        WHERE ValidationError IS NOT NULL;
+
+        SET @RowsRejected = (SELECT COUNT(*) FROM #InvalidData);
+
+        --------------------------------------------------------------------
+        -- 4. Log rejected records
+        --------------------------------------------------------------------
+        INSERT INTO [audit].[rejected_records] (
+            BatchId,
+            SourceTable,
+            CustomerId,
+            ErrorMessage,
+            RejectedAt
+        )
+        SELECT 
+            @BatchId,
+            'stg.customer_sales',
+            CustomerId,
+            ValidationError,
+            SYSDATETIME()
+        FROM #InvalidData;
+
+        --------------------------------------------------------------------
+        -- 5. Transform valid data (example: region normalization)
+        --------------------------------------------------------------------
+        SELECT
+            CustomerId,
+            OrderDate,
+            SalesAmount,
+            UPPER(Region) AS Region,
+            SYSDATETIME() AS LoadTimestamp
+        INTO #Transformed
+        FROM #ValidData;
+
+        --------------------------------------------------------------------
+        -- 6. Upsert into target table
+        --------------------------------------------------------------------
+        MERGE [dbo].[customer_sales_final] AS tgt
+        USING #Transformed AS src
+            ON tgt.CustomerId = src.CustomerId
+           AND tgt.OrderDate = src.OrderDate
+        WHEN MATCHED THEN
+            UPDATE SET 
+                tgt.SalesAmount = src.SalesAmount,
+                tgt.Region = src.Region,
+                tgt.LastUpdated = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (CustomerId, OrderDate, SalesAmount, Region, CreatedAt)
+            VALUES (src.CustomerId, src.OrderDate, src.SalesAmount, src.Region, src.LoadTimestamp);
+
+        SET @RowsInserted = @@ROWCOUNT;
+
+        --------------------------------------------------------------------
+        -- 7. Log success to audit table
+        --------------------------------------------------------------------
+        INSERT INTO [audit].[etl_log] (
+            BatchId,
+            ProcedureName,
+            Status,
+            StartTime,
+            EndTime,
+            RowsInserted,
+            RowsRejected
+        )
+        VALUES (
+            @BatchId,
+            'etl.usp_load_customer_sales',
+            'SUCCESS',
+            @StartTime,
+            SYSDATETIME(),
+            @RowsInserted,
+            @RowsRejected
+        );
+
+        --------------------------------------------------------------------
+        -- 8. Clean up staging data
+        --------------------------------------------------------------------
+        DELETE FROM [stg].[customer_sales];
+
+    END TRY
+    BEGIN CATCH
+        --------------------------------------------------------------------
+        -- 9. Handle errors
+        --------------------------------------------------------------------
+        SET @ErrorMessage = ERROR_MESSAGE();
+
+        INSERT INTO [audit].[etl_log] (
+            BatchId,
+            ProcedureName,
+            Status,
+            StartTime,
+            EndTime,
+            ErrorMessage
+        )
+        VALUES (
+            @BatchId,
+            'etl.usp_load_customer_sales',
+            'FAILED',
+            @StartTime,
+            SYSDATETIME(),
+            @ErrorMessage
+        );
+
+        THROW;
+    END CATCH;
+END;
+GO
